@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "Gamecube Dat Model",
-    "author": "M",
-    "blender": (3, 1, 0),
+    "name": "Gamecube Dat Export - Import Model",
+    "author": "EverydaySimpleDev",
+    "blender": (2, 83, 9),
     "location": "File > Import-Export",
     "description": "Import-Export Gamecube .dat models",
     "warning": "",
@@ -20,6 +20,7 @@ if "bpy" in locals():
 
 import os
 import bpy
+from mathutils import Matrix
 from bpy.props import (
         CollectionProperty,
         StringProperty,
@@ -27,19 +28,31 @@ from bpy.props import (
         EnumProperty,
         FloatProperty,
         IntProperty,
-        )
+)
 from bpy_extras.io_utils import (
         ImportHelper,
         ExportHelper,
         axis_conversion,
-        )
-
+        orientation_helper,
+        axis_conversion,
+)
+from bpy.types import (
+    Operator,
+    OperatorFileListElement,
+)
 
 class ImportHSD(bpy.types.Operator, ImportHelper):
     """Load a HSD scene"""
     bl_idname = "import_scene.hsd"
-    bl_label = "Import HSD"
+    bl_label = "Import Dat"
     bl_options = {'UNDO'}
+
+    global_scale: FloatProperty(
+        name="Scale",
+        soft_min=0.001, soft_max=1000.0,
+        min=1e-6, max=1e6,
+        default=1.0,
+    )
 
     files: bpy.props.CollectionProperty(name="File Path",
                           description="File path used for importing "
@@ -68,6 +81,11 @@ class ImportHSD(bpy.types.Operator, ImportHelper):
 
         from . import import_hsd
 
+        scene = context.scene
+
+        global_scale = self.global_scale
+        global_scale /= scene.unit_settings.scale_length
+
         #import trace
         #tracer = trace.Trace(trace=1)
 
@@ -81,99 +99,157 @@ class ImportHSD(bpy.types.Operator, ImportHelper):
 
         return {'FINISHED'}
 
-
+@orientation_helper(axis_forward='Y', axis_up='Z')
 class ExportHSD(bpy.types.Operator, ExportHelper):
-    """Export a single object as a Stanford PLY with normals, """ \
-    """colors and texture coordinates"""
-    bl_idname = "export_scene.hsd"
-    bl_label = "Export HSD"
 
-    @classmethod
-    def poll(cls, context):
-        return context.active_object is not None
+    bl_idname = "export_scene.dat"
+    bl_label = "Export Dat"
+    filename_ext = ".dat"
 
-    def execute(self, context):
-        pass
+    filter_glob = StringProperty(default="*.dat", options={'HIDDEN'})
 
-    def draw(self, context):
-        pass
-    """
-    bl_idname = "export_mesh.ply"
-    bl_label = "Export PLY"
-
-    filename_ext = ".ply"
-    filter_glob = StringProperty(default="*.ply", options={'HIDDEN'})
+    use_selection: BoolProperty(
+        name="Selection Only",
+        description="Export selected objects only",
+        default=False,
+    )
+    global_scale: FloatProperty(
+        name="Scale",
+        min=0.01, max=1000.0,
+        default=1.0,
+    )
+    use_scene_unit: BoolProperty(
+        name="Scene Unit",
+        description="Apply current scene's unit (as defined by unit scale) to exported data",
+        default=False,
+    )
+    ascii: BoolProperty(
+        name="Ascii",
+        description="Save the file in ASCII file format",
+        default=False,
+    )
+    use_mesh_modifiers: BoolProperty(
+        name="Apply Modifiers",
+        description="Apply the modifiers before saving",
+        default=True,
+    )
+    batch_mode: EnumProperty(
+        name="Batch Mode",
+        items=(
+            ('OFF', "Off", "All data in one file"),
+            ('OBJECT', "Object", "Each object as a file"),
+        ),
+    )
 
     use_mesh_modifiers = BoolProperty(
             name="Apply Modifiers",
             description="Apply Modifiers to the exported mesh",
             default=True,
             )
-    use_normals = BoolProperty(
-            name="Normals",
-            description="Export Normals for smooth and "
-                        "hard shaded faces "
-                        "(hard shaded faces will be exported "
-                        "as individual faces)",
-            default=True,
-            )
-    use_uv_coords = BoolProperty(
-            name="UVs",
-            description="Export the active UV layer",
-            default=True,
-            )
-    use_colors = BoolProperty(
-            name="Vertex Colors",
-            description="Export the active vertex color layer",
-            default=True,
-            )
+    # use_normals = BoolProperty(
+    #         name="Normals",
+    #         description="Export Normals for smooth and "
+    #                     "hard shaded faces "
+    #                     "(hard shaded faces will be exported "
+    #                     "as individual faces)",
+    #         default=True,
+    #         )
+    # use_uv_coords = BoolProperty(
+    #         name="UVs",
+    #         description="Export the active UV layer",
+    #         default=True,
+    #         )
+    # use_colors = BoolProperty(
+    #         name="Vertex Colors",
+    #         description="Export the active vertex color layer",
+    #         default=True,
+    #         )
 
-    global_scale = FloatProperty(
-            name="Scale",
-            min=0.01, max=1000.0,
-            default=1.0,
-            )
 
     @classmethod
     def poll(cls, context):
         return context.active_object is not None
 
     def execute(self, context):
-        from . import export_ply
-
+        import os
+        import itertools
         from mathutils import Matrix
+        from . import stl_utils
+        from . import blender_utils
+        # from . import export_ply
 
-        keywords = self.as_keywords(ignore=("axis_forward",
-                                            "axis_up",
-                                            "global_scale",
-                                            "check_existing",
-                                            "filter_glob",
-                                            ))
-        global_matrix = axis_conversion(to_forward=self.axis_forward,
-                                        to_up=self.axis_up,
-                                        ).to_4x4() * Matrix.Scale(self.global_scale, 4)
-        keywords["global_matrix"] = global_matrix
+        scene = context.scene
+        if self.use_selection:
+            data_seq = context.selected_objects
+        else:
+            data_seq = scene.objects
 
-        filepath = self.filepath
-        filepath = bpy.path.ensure_ext(filepath, self.filename_ext)
+        keywords = self.as_keywords(
+            ignore=(
+                "axis_forward",
+                "axis_up",
+                "use_selection",
+                "global_scale",
+                "check_existing",
+                "filter_glob",
+                "use_scene_unit",
+                "use_mesh_modifiers",
+                "batch_mode"
+            ),
+        )
 
-        return export_ply.save(self, context, **keywords)
+        global_scale = self.global_scale
+        global_scale *= scene.unit_settings.scale_length
+
+        global_matrix = axis_conversion(
+            to_forward=self.axis_forward,
+            to_up=self.axis_up,
+        ).to_4x4() @ Matrix.Scale(global_scale, 4)
+
+    
+        # global_matrix = axis_conversion(to_forward=self.axis_forward,
+        #                                 to_up=self.axis_up,
+        #                                 ).to_4x4() * Matrix.Scale(self.global_scale, 4)
+
+        prefix = os.path.splitext(self.filepath)[0]
+        keywords_temp = keywords.copy()
+
+        faces = itertools.chain.from_iterable(
+                blender_utils.faces_from_mesh(ob, global_matrix, self.use_mesh_modifiers)
+                for ob in data_seq)
+
+        stl_utils.write_stl(faces=faces, **keywords)
+
+        # For each object make a file
+        # for ob in data_seq:
+        #     faces = blender_utils.faces_from_mesh(ob, global_matrix, self.use_mesh_modifiers)
+        #     keywords_temp["filepath"] = prefix + bpy.path.clean_name(ob.name) + ".dat"
+        #     stl_utils.write_stl(faces=faces, **keywords_temp)
+
+        # keywords["global_matrix"] = global_matrix
+
+        # filepath = self.filepath
+        # filepath = bpy.path.ensure_ext(filepath, self.filename_ext)
+
+        return {'FINISHED'}
+
+        # return export_ply.save(self, context, **keywords)
 
     def draw(self, context):
-        layout = self.layout
+        pass
 
-        row = layout.row()
-        row.prop(self, "use_mesh_modifiers")
-        row.prop(self, "use_normals")
-        row = layout.row()
-        row.prop(self, "use_uv_coords")
-        row.prop(self, "use_colors")
+        # layout = self.layout
 
-        layout.prop(self, "axis_forward")
-        layout.prop(self, "axis_up")
-        layout.prop(self, "global_scale")
-    """
+        # row = layout.row()
+        # row.prop(self, "use_mesh_modifiers")
+        # row.prop(self, "use_normals")
+        # row = layout.row()
+        # row.prop(self, "use_uv_coords")
+        # row.prop(self, "use_colors")
 
+        # layout.prop(self, "axis_forward")
+        # layout.prop(self, "axis_up")
+        # layout.prop(self, "global_scale")
 
 def menu_func_import(self, context):
     self.layout.operator(ImportHSD.bl_idname, text="Gamecube Dat Model (.dat)")
